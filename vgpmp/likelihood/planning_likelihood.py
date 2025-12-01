@@ -18,7 +18,7 @@ class PlanningLikelihood(gpflow.likelihoods.Likelihood):
         self.obs_scale = gpflow.Parameter(obs_scale, transform=gpflow.utilities.positive())
         self.temperature = gpflow.Parameter(temperature, transform=gpflow.utilities.positive())
 
-        self.center = tf.constant((2.0, 8.0), dtype=DTYPE)
+        self.center = tf.constant((5.0, 5.5), dtype=DTYPE)
         self.radius = tf.constant(0.5, dtype=DTYPE)
                 
         self.grid_size = tf.constant(10.0, dtype=DTYPE)

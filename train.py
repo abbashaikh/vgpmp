@@ -19,6 +19,8 @@ def plot_mean_and_obstacle(model, X):
     # Model mean
     f_mean, f_var = model.predict_f(X)
     mean_pos = f_mean.numpy()
+    var_pos = f_var.numpy()
+    std_pos  = np.sqrt(np.maximum(var_pos, 0.0))
 
     # Obstacle params
     cx, cy = model.likelihood.center.numpy()
@@ -28,6 +30,11 @@ def plot_mean_and_obstacle(model, X):
 
     fig, ax = plt.subplots()
     ax.plot(mean_pos[:, 0], mean_pos[:, 1], "-o", label="mean trajectory", color="C0")
+
+    # scale = std_pos[:, 0]
+    # lb = (mean_pos[:, 0] - 2*scale)
+    # ub = (mean_pos[:,1 ] - 2*scale)
+    # plt.fill_between(lb, ub, color="grey", alpha=0.1)
 
     # Obstacle circle and (optional) safety buffer R+epsilon
     circle = plt.Circle((cx, cy), r, color="red", alpha=0.25, label="obstacle")
@@ -66,15 +73,15 @@ if __name__=="__main__":
     # initialize posterior
     q_mu = tf.constant(
         [
-            [1.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-            [1.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            [1.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.5, 9.0],
+            [1.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.5, 9.0],
         ],
         dtype=DTYPE
     )
     
     prior = MaternPositionPrior(dof, M=num_interior, t_min=t0, t_max=tN, matern_family="52")
     planning_lik = PlanningLikelihood(latent_dim=dof, obs_scale=2.0, temperature=1.0)
-    model = VGPPlanner(prior, planning_lik, q_mu)
+    model = VGPPlanner(prior, planning_lik, tf.transpose(q_mu, [1, 0]))
 
     data = {
         "interior": (X_in, Y_in),
@@ -96,7 +103,7 @@ if __name__=="__main__":
         adam_opt.minimize(loss_fn, adam_vars)
         tf.debugging.assert_all_finite(model.q_sqrt, "q_sqrt has NaNs after update")
 
-    num_iters = 100
+    num_iters = 50
     for _ in range(num_iters):
         optimization_step(data)
 
