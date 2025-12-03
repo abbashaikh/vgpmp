@@ -3,7 +3,7 @@ import math
 import gpflow
 import tensorflow as tf
 
-class VGPPlanner(gpflow.models.SVGP):
+class MaternVGP(gpflow.models.SVGP):
     """
     SVGP over positions with custom planning likelihood for interior points,
     plus near-hard endpoint observations via a high-precision Gaussian.

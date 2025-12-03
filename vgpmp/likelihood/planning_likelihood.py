@@ -19,13 +19,13 @@ class PlanningLikelihood(gpflow.likelihoods.Likelihood):
         self.temperature = gpflow.Parameter(temperature, transform=gpflow.utilities.positive())
 
         self.center = tf.constant((5.0, 5.5), dtype=DTYPE)
-        self.radius = tf.constant(0.5, dtype=DTYPE)
+        self.radius = tf.constant(1.0, dtype=DTYPE)
                 
         self.grid_size = tf.constant(10.0, dtype=DTYPE)
         self.epsilon = tf.constant(0.1, dtype=DTYPE)
-        self.sigma_obs = tf.constant(1.0, dtype=DTYPE)
+        self.sigma_obs = tf.constant(0.5, dtype=DTYPE)
         self.sigma_box = tf.constant(1.0, dtype=DTYPE)
-        self.hinge_softness = tf.constant(5.0, dtype=DTYPE)
+        self.hinge_softness = tf.constant(0.5, dtype=DTYPE)
         self.enforce_box = False
 
     def _hinge(self, x: tf.Tensor) -> tf.Tensor:

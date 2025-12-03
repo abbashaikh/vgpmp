@@ -1,11 +1,10 @@
 import tensorflow as tf
 import gpflow as gf
 
-from .dynamics import ConstantVelocityModel
+from ..dynamics.constant_velocity import ConstantVelocityModel
 # from .block_tridiag import BlockTriDiag
 
 DTYPE = tf.float32
-
 
 
 class GaussMarkovPrior(gf.Module):

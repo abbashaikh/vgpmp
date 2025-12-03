@@ -2,10 +2,10 @@ import numpy as np
 import tensorflow as tf
 import gpflow as gf
 
-from .dynamics import ConstantVelocityModel
-from .prior import GaussMarkovPrior
-from .likelihood import CollisionLikelihood
-from .models import VGP
+from vgpmp.dynamics.constant_velocity import ConstantVelocityModel
+from vgpmp.prior.markov_prior import GaussMarkovPrior
+from vgpmp.old.likelihood import CollisionLikelihood
+from vgpmp.models.markov_vgp import MarkovVGP
 
 DTYPE = tf.float32
 
@@ -15,6 +15,7 @@ Notation:
     N -> number of time segments
 """
 
+# TODO: implement natural gradients
 @tf.function(jit_compile=False)
 def step(model, nsamples=32):
     with tf.GradientTape() as tape:
@@ -36,36 +37,29 @@ def step(model, nsamples=32):
 
 
 if __name__=="__main__":
-    # shape(times) = num of segments + 1
-    times = tf.constant(np.linspace(0.0, 1.0, 51), dtype=DTYPE)
-
+    # system's degree of freedom
     dof = 2
-    dynamics_model = ConstantVelocityModel(dof, q_acc=1e-12)
 
-    # initial
-    K0  = tf.linalg.diag(
-        tf.concat([
-            1e-3*tf.ones([dof], DTYPE),     # q0 variance
-            1e-3*tf.ones([dof], DTYPE),     # v0 variance
-        ], axis=0)
-    )                                       # shape (D, D)
-    mu0 = tf.zeros([2*dof], DTYPE)          # shape (D,)
-    start = (K0, mu0) 
+    '''Train Data'''
+    # start and goal positions
+    q_start = np.array([0.0, 0.0], dtype=np.float64)
+    q_goal  = np.array([10.0, 10.0], dtype=np.float64)
+    # start and end time
+    t0, tN  = 0.0, 1.0
+    # number of interior support points (K)
+    num_steps = 10
+    ## Interior points
+    # Times excluding start and end
+    t_interior = np.linspace(t0, tN, num_steps + 1)[1:-1]
+    X_in = t_interior.reshape(-1, 1).astype(np.float64)         # shape (K,1)
+    # Dummy Y_in if your likelihood ignores Y
+    Y_in = np.zeros((num_steps - 1, dof), dtype=np.float64)      # shape (K, dof)
+    ## End points
+    X_ep = np.array([[t0], [tN]], dtype=np.float64)             # shape (2,1)
+    Y_ep = np.stack([q_start, q_goal], axis=0)                  # shape (2,dof)
 
-    q_goal = tf.concat([10.0, 10.0], axis=0)
-    
-    # terminal
-    KN  = tf.linalg.diag(
-        tf.concat([
-            1e-3*tf.ones([dof], DTYPE),    # q0 variance
-            1e-3*tf.ones([dof], DTYPE),    # v0 variance
-        ], axis=0)
-    )
-    muN = tf.concat([
-        q_goal,
-        tf.zeros([dof], DTYPE)
-    ], axis=0)
-    end = (KN, muN)
+    '''Test Data'''
+    X_test = np.linspace(t0, tN, 20, dtype=np.float64).reshape(-1,1)
 
     prior = GaussMarkovPrior(
         times,
@@ -89,8 +83,18 @@ if __name__=="__main__":
         enforce_box=True,
     )
 
-    model = VGP(prior, likelihood)
+    model = MarkovVGP(
+        data,
+        kernel,
+        prior,
+        likelihood,
+        num_samples=num_steps,
+        num_latent_gps=dof
+    )
 
+    #TODO: set trainable parameters and assign appropriate priors to them
+
+    '''Training loop'''
     opt = tf.keras.optimizers.Adam(learning_rate=1e-2)
     for it in range(1000):
         loss_val = step(model, nsamples=32)
@@ -105,6 +109,7 @@ if __name__=="__main__":
         options=dict(maxiter=200)
     )
 
+    '''Output'''
     ## Mean plan on the support grid
     plan = model.m.numpy()  # shape: (N+1, D)
 

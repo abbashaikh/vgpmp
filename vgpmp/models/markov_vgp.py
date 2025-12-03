@@ -1,23 +1,45 @@
-from typing import List
+from typing import List, Optional
+
 import tensorflow as tf
 import gpflow
 
-from .prior import GaussMarkovPrior
-from .likelihood import CollisionLikelihood
-from .matrix_utils import logdet_gauss_markov_cov
+from ..base import RegressionData
+from ..kernels import GaussMarkovKernel
+from ..prior.markov_prior import GaussMarkovPrior
+from ..old.likelihood import CollisionLikelihood
+from ..utils.matrix_utils import logdet_gauss_markov_cov
 
 DTYPE = tf.float32
 MIN_SCALE = tf.cast(1e-3, DTYPE)  # lower bound for diag entries
 
-class VGP(gpflow.models.BayesianModel):
-    def __init__(self, prior: GaussMarkovPrior, likelihood: CollisionLikelihood):
+class MarkovVGP(gpflow.VGP):
+    def __init__(
+        self,
+        data: RegressionData,
+        kernel: GaussMarkovKernel,
+        prior,
+        likelihood: gpflow.likelihoods.Likelihood,
+        num_samples: int,
+        mean_function: Optional[gpflow.mean_functions.MeanFunction] = None,
+        num_latent_gps: Optional[int] = None,
+    ):
         r"""
         Covariance of the approximate posterior :math: `q(x)`
         is parameterized as :math: `S = \tilde{A} \tilde{Q} \tilde{A}^T`
         where :math: `\tilde{A}` is dense lower triangular
         and :math: `\tilde{Q}` is block diagonal.
         """
+        #TODO: ensure kernel inherits Multioutput Kernel
+        super().__init__(kernel, likelihood, mean_function, num_latent_gps)
+
+        self.num_samples = num_samples
         self.prior = prior
+        self.likelihood = likelihood
+
+        # TODO: map (start, end) -> (-/infty, +/infty) (inverse sigmoid)
+        # TODO: do we need to initialize optimizer here?
+        # TODO: initiate q_mu as a linear interpolation 
+
         # Prior mean
         self.mu = prior.mean
         # Prior covariance
