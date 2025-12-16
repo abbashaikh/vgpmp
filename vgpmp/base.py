@@ -8,3 +8,5 @@ TensorType = Union[np.ndarray ,tf.Tensor, tf.Variable, Parameter]
 InputData = Union[TensorType]
 OutputData = Union[TensorType]
 RegressionData = Tuple[InputData, OutputData]
+
+MeanAndVariance = Tuple[tf.Tensor, tf.Tensor]
