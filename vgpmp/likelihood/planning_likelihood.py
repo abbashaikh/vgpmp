@@ -6,25 +6,31 @@ import gpflow
 from gpflow.config import default_float, default_jitter
 
 from ..posterior import GaussMarkovPosterior
-from ..utils.linear_algebra import Cholesky
+from ..utils.linear_algebra import Covariance
 
 SQRT_PI = 1.77245385091
 SQRT_TWO = 1.41421356237
 
-class PlanningLikelihood():
+
+class PlanningLikelihood:
     """
     Expects fmean,fvar at support times; computes E_q[log p(y|f)]
-    where log p encodes negative penalty terms. We'll estimate with MC.
+    where log p encodes negative penalty terms. Estimate with GH or MC.
+
+    NOTE: The implementations below use ONLY the marginal covariances S_kk (diagonal blocks)
+    and therefore ignore cross-time correlations in fvar.
     """
     def __init__(
         self,
-        dof:int = 2,
+        dof: int = 2,
         obstacle_center=(5.0, 5.0),
         obstacle_radius=2.0,
+        desired_nominal=None,
         grid_size=10.0,
         epsilon: float = 0.1,
-        sigma_obs: float = 0.1,
+        sigma_obs: float = 0.2,
         hinge_softness: float = 0.5,
+
     ):
         self.dof = dof
 
@@ -36,151 +42,229 @@ class PlanningLikelihood():
         self.sigma_obs = tf.constant(sigma_obs, dtype=default_float())
         self.hinge_softness = tf.constant(hinge_softness, dtype=default_float())
         self.enforce_box = False
+        self.sigma_box = tf.constant(0.1, dtype=default_float())
+
+        self.sigma_nominal = tf.constant(0.4, dtype=default_float())
+        self.tracking_weight = tf.constant(5.0, dtype=default_float())
+        self.desired_nominal  = None if desired_nominal  is None else tf.constant(desired_nominal,  dtype=default_float())
 
     def _hinge(self, x: tf.Tensor) -> tf.Tensor:
         s = tf.cast(self.hinge_softness, x.dtype)
         return tf.nn.softplus(x / s) * s
-    
+
     def _circle_signed_distance(self, Pxy: tf.Tensor) -> tf.Tensor:
         """
         Pxy: [S, K, 2]; returns sdist: [S, K], positive outside circle.
         """
         d = tf.norm(Pxy - self.center, axis=-1)  # [S, K]
         return d - self.radius
-    
+
     def _box_violation(self, Pxy: tf.Tensor) -> tf.Tensor:
         """
-        Pxy: [S, N, 2]; returns nonnegative violation per time: [S, K]
+        Pxy: [S, K, 2]; returns nonnegative violation per time: [S, K]
         """
-        x = Pxy[..., 0]  # shape (S, K)
-        y = Pxy[..., 1]  # shape (S, K)
+        x = Pxy[..., 0]
+        y = Pxy[..., 1]
         L = self.grid_size
 
-        lower = self._hinge(-x) + self._hinge(-y)              # below 0
-        upper = self._hinge(x - L) + self._hinge(y - L)        # above L
+        lower = self._hinge(-x) + self._hinge(-y)
+        upper = self._hinge(x - L) + self._hinge(y - L)
         return lower + upper
-    
-    def _penalty(self, fsamp):
-        Pxy = tf.stack([fsamp[..., 0], fsamp[..., 1]], axis=-1)
+
+    def _penalty(self, fsamp: tf.Tensor) -> tf.Tensor:
+        """
+        fsamp: [S, K, P] (or [S,K,dof] if already reduced)
+        returns: [S, K] nonnegative
+        """
+        Pxy = fsamp[..., :self.dof]
         Pxy = tf.cast(Pxy, dtype=fsamp.dtype)
 
-        sdist = self._circle_signed_distance(Pxy)                               # shape (S,K)
+        sdist = self._circle_signed_distance(Pxy)  # [S,K]
         penetration = self._hinge(tf.cast(self.epsilon, dtype=fsamp.dtype) - sdist)
         coll = (penetration / self.sigma_obs) ** 2
 
         if self.enforce_box:
-            vbox = self._box_violation(Pxy)                                     # shape (S, K)
-            box = (vbox / self.sigma_box)**2
+            vbox = self._box_violation(Pxy)
+            box = (vbox / self.sigma_box) ** 2
         else:
-            box  = tf.zeros_like(coll)
+            box = tf.zeros_like(coll)
 
-        return coll + box   # [S, K], nonnegative
+        return coll + box
+
+    def _expected_boundary_penalty(self, fmean: tf.Tensor, fvar: Covariance) -> tf.Tensor:
+        """
+        Returns per-time penalty vector shape (N,) with nonzero entries only at k=1 and k=N-2.
+
+        Uses exact identity:
+        E[||X-a||^2] = ||mu-a||^2 + tr(Sigma)
+        for X ~ N(mu, Sigma), using only marginal S_kk.
+        """
+        N = tf.shape(fmean)[0]
+
+        penalties = tf.zeros([N], dtype=default_float())
+
+        # position mean/cov
+        mu_xy = fmean[:, :self.dof]                # (N,dof)
+        S_xy = fvar.diags[:, :self.dof, :self.dof] # (N,dof,dof)
+        tr_S = tf.linalg.trace(S_xy)               # (N,)
+
+        # start penalty at k=1
+        if self.desired_start is not None:
+            diff1 = mu_xy[1] - self.desired_start           # (dof,)
+            e_sq1 = tf.reduce_sum(diff1 * diff1) + tr_S[1]                  # scalar
+            p1 = self.boundary_weight * (e_sq1 / (self.sigma_start ** 2))   # scalar
+            penalties = tf.tensor_scatter_nd_add(penalties, indices=[[1]], updates=[p1])
+
+        # goal penalty at k=N-2
+        if self.desired_goal is not None:
+            diffN = mu_xy[N - 2] - self.desired_goal
+            e_sqN = tf.reduce_sum(diffN * diffN) + tr_S[N - 2]
+            pN = self.boundary_weight * (e_sqN / (self.sigma_goal ** 2))
+            penalties = tf.tensor_scatter_nd_add(penalties, indices=[[N - 2]], updates=[pN])
+
+        return penalties
+    
+    def _expected_nominal_tracking_penalty(
+        self,
+        fmean: tf.Tensor,   # (N,P)
+        fvar: Covariance,   # fvar.diags: (N,P,P)
+    ) -> tf.Tensor:
+        """
+        Per-time expected quadratic tracking cost to a nominal trajectory (full state).
+        Returns: (N,)
+
+        E[||x_k - x_nom_k||^2] = ||mu_k - x_nom_k||^2 + tr(Sigma_k)
+        """
+        fmean = tf.convert_to_tensor(fmean, dtype=default_float())
+        Sdiag = tf.convert_to_tensor(fvar.diags, dtype=fmean.dtype)
+
+        N = tf.shape(fmean)[0]
+        P = tf.shape(fmean)[1]
+
+        nominal = tf.convert_to_tensor(self.desired_nominal, dtype=fmean.dtype)
+
+        # (N,P)
+        diff = fmean - nominal
+        sq = tf.reduce_sum(diff * diff, axis=1)          # (N,)
+
+        # tr(Sigma_k) for full state: (N,)
+        trS = tf.linalg.trace(Sdiag)                     # (N,)
+
+        cost = self.tracking_weight * (sq + trS) / (self.sigma_nominal ** 2)  # (N,)
+        return cost
     
     def _gauss_hermite_params(self, order: int):
-        # nodes and weights for e^{-x^2}
-        xi, wi = np.polynomial.hermite.hermgauss(order)
-        xi = tf.convert_to_tensor(xi, dtype=default_float())    # shape (order,)
-        wi = tf.convert_to_tensor(wi, dtype=default_float())    # shape (order,)
+        xi, wi = np.polynomial.hermite.hermgauss(order)  # for e^{-x^2}
+        xi = tf.convert_to_tensor(xi, dtype=default_float())  # (K,)
+        wi = tf.convert_to_tensor(wi, dtype=default_float())  # (K,)
         norm = tf.cast(SQRT_PI, dtype=default_float())
-        return xi, wi / norm    
-    
-    def _sample_posterior(self, fmean: tf.Tensor, fvar: Cholesky, nsamples: int):
+        return xi, wi / norm
+
+    def _marginal_choleskies(self, fvar: Covariance, N: tf.Tensor) -> tf.Tensor:
         """
-        Input:
-            fmean: 
-            cov: 
+        Compute C_k such that S_kk = C_k C_k^T using diagonal blocks directly:
+          S_kk = fvar.diags[k]
+        Returns: C of shape (N,P,P)
         """
-        P = tf.shape(fmean)[-1]
-        if tf.equal(tf.rank(fmean), 2):
-            N = tf.shape(fmean)[0]
+        # This assumes fvar.diags is (N,P,P).
+        Sdiag = fvar.diags  # (N,P,P)
+        Sdiag = 0.5 * (Sdiag + tf.transpose(Sdiag, perm=[0, 2, 1]))
+        Sdiag = Sdiag + default_jitter() * tf.eye(tf.shape(Sdiag)[1], dtype=Sdiag.dtype)[None, :, :]
+        return tf.linalg.cholesky(Sdiag)
+
+    def _sample_posterior(self, fmean: tf.Tensor, fvar: Covariance, nsamples: int) -> tf.Tensor:
+        """
+        Draw samples using per-time marginals only (ignores cross-time correlations).
+
+        Inputs:
+          fmean: (N,P)
+          fvar : Covariance with diags (N,P,P)
+        Returns:
+          samples: (S,N,P)
+        """
+        fmean = tf.convert_to_tensor(fmean)
+        N = tf.shape(fmean)[0]
+        P = tf.shape(fmean)[1]
+
+        C = self._marginal_choleskies(fvar, N)  # (N,P,P)
+
+        # z: (S,N,P)
+        z = tf.random.normal([nsamples, N, P], dtype=fmean.dtype)
+
+        # y_k = z_k @ C_k^T  (broadcast over samples)
+        y = tf.einsum("snp,npq->snq", z, tf.transpose(C, perm=[0, 2, 1]))  # (S,N,P)
+
+        return y + fmean[None, :, :]
+
+    def variational_expectations(
+        self,
+        fmean: tf.Tensor,
+        fvar: Covariance,
+        method: str = "gauss_hermite",
+        order: int = 10,
+        nsamples: int = 8,
+        Y=None,
+    ):
+        """
+        Returns expected collision penalty per time index: shape (N,).
+        Uses only marginal S_kk blocks from fvar.
+        """
+        fmean = tf.convert_to_tensor(fmean)
+        N = tf.shape(fmean)[0]
+        P = tf.shape(fmean)[1]
+
+        if method == "gauss_hermite":
+            xi, wi = self._gauss_hermite_params(order)  # (K,), (K,)
+            X1, X2 = tf.meshgrid(xi, xi, indexing="ij")  # (K,K)
+            W2 = wi[:, None] * wi[None, :]               # (K,K)
+
+            # Z: (K,K,2)
+            Z = tf.stack([X1, X2], axis=-1)
+
+            # C: (N,P,P) from marginal S_kk
+            C = self._marginal_choleskies(fvar, N)  # (N,P,P)
+
+            # Use only position dims (dof)
+            Cxy = C[:, :self.dof, :self.dof]  # (N,dof,dof)
+
+            # f = mu + sqrt(2) * Cxy @ z
+            # result: (N,K,K,dof)
+            f = tf.einsum("nij,klj->nkli", Cxy, Z)
+            f = fmean[:, None, None, :self.dof] + tf.cast(SQRT_TWO, fmean.dtype) * f
+
+            # Signed distance to circle
+            diff = f - self.center[None, None, None, :]          # (N,K,K,dof)
+            sdist = tf.norm(diff, axis=-1) - self.radius         # (N,K,K)
+
+            s = tf.cast(self.hinge_softness, fmean.dtype)
+            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s  # (N,K,K)
+            coll = (penetration / self.sigma_obs) ** 2                    # (N,K,K)
+
+            E_coll = tf.reduce_sum(coll * W2[None, :, :], axis=(1, 2))      # (N,)
+            E_track = self._expected_nominal_tracking_penalty(fmean, fvar)
+
+            return E_coll + E_track
+
+        elif method == "monte_carlo":
+            fsamples = self._sample_posterior(fmean, fvar, nsamples)  # (S,N,P)
+            Pxy = fsamples[..., :self.dof]                            # (S,N,dof)
+
+            diff = Pxy - self.center[None, None, :]                   # (S,N,dof)
+            sdist = tf.norm(diff, axis=-1) - self.radius              # (S,N)
+
+            s = tf.cast(self.hinge_softness, fmean.dtype)
+            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s  # (S,N)
+            coll = (penetration / self.sigma_obs) ** 2                    # (S,N)
+
+            E_coll = tf.reduce_mean(coll, axis=0)                         # (N,)
+            E_track = self._expected_nominal_tracking_penalty(fmean, fvar)
+
+            return E_coll + E_track
+
         else:
-            N = 1
-
-        # calculate choleskies of S_{kk}: C_{kk}
-        C_list = []
-        for k in range(N):
-            cov_cholesky_row_k = fvar.get_row(k)
-            B_k = tf.concat(cov_cholesky_row_k, axis=1)         # shape (P, k+1*P)
-            S_kk = tf.matmul(B_k, B_k, transpose_b=True)
-            # cholesky of S_{kk}
-            C_k = tf.linalg.cholesky(S_kk)                      # shape (P,P)
-            C_list.append(C_k)
-
-        # sample z_i from a standard normal
-        z_blocks = [tf.random.normal([nsamples, P], dtype=default_float()) for _ in range(N)]
-        # y_k ~ normal(0, S_kk)
-        y_blocks = [tf.matmul(zi, C_kk, transpose_b=True) for zi, C_kk in zip(z_blocks, fvar)]
-        y_samples = tf.stack(y_blocks, axis=1)          # shape (nsamples, N, P)
-        # y_k ~ normal(m_k, S_kk)
-        y_samples = y_samples + fmean[tf.newaxis, ...]   # shape (nsamples, N, P)
-        return y_samples
-    
-    def variational_expectations(self, fmean: tf.Tensor, fvar: Cholesky, method: str = "gauss_hermite", order: int = 10, nsamples: int = 8, Y=None):
-        """
-        Gauss-Hermite of order K
-        Input:
-            fmean: shape (N, P)
-            fvar: of type Cholesky
-
-        Monte-carlo with nsamples
-        Input:
-            fmean: shape (N, P)
-            fvar: of type Cholesky
-        """
-        if method=="gauss_hermite":
-            N = tf.shape(fmean)[0]
-
-            xi, wi = self._gauss_hermite_params(order)              # shape (K,)
-            X1, X2 = tf.meshgrid(xi, xi, indexing='ij')             # shape (K,K)
-            W2 = (wi[:, None] * wi[None, :])                        # shape (K,K)
-
-            # z = [X1, X2]
-            Z = tf.stack([X1, X2], axis=-1)                         # shape (K,K,2)
-
-            # calculate choleskies of S_{kk}: C_{kk}
-            C_list = []
-            for k in range(N):
-                cov_cholesky_row_k = fvar.get_row(k)
-                B_k = tf.concat(cov_cholesky_row_k, axis=1)         # shape (P, k+1*P)
-                S_kk = tf.matmul(B_k, B_k, transpose_b=True)
-                # cholesky of S_{kk}
-                C_k = tf.linalg.cholesky(S_kk)                      # shape (P,P)
-                C_list.append(C_k)
-            C = tf.stack(C_list, axis=0)                            # shape (N,P,P)
-
-
-            # f = mu + sqrt(2) L z
-            f = tf.einsum('nij,kkj->nkk i', C[:, :self.dof, :self.dof], Z)  # [N,K,K,dof]
-            f = fmean[:, None, None, :self.dof] + tf.cast(SQRT_TWO, dtype=default_float()) * f
-
-            # Signed distance to circle: ||f - center|| - radius
-            diff   = f - self.center[None, None, None, :]                   # [N,K,K,dof]
-            sdist  = tf.norm(diff, axis=-1) - self.radius                   # [N,K,K]
-
-            s = self.hinge_softness
-            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s    # [N,K,K]
-            coll = (penetration / self.sigma_obs)**2                        # [N,K,K]
-
-            E_coll = tf.reduce_sum(coll * W2[None, :, :], axis=(1,2))       # [N]
-            return E_coll
-
-        elif method=="monte_carlo":
-            fsamples = self._sample_posterior(fmean, fvar, nsamples)
-            Pxy = fsamples[..., :self.dof]
-
-            # Signed distance to circle: ||f - center|| - radius (per sample)
-            diff   = Pxy - self.center[tf.newaxis, tf.newaxis, :]           # [S,N,dof]
-            sdist  = tf.norm(diff, axis=-1) - self.radius                   # [S,N]
-
-            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s    # [S,N]
-            coll = (penetration / self.sigma_obs)**2                        # [S,N]
-
-            E_coll = tf.reduce_sum(coll, axis=0)                            # [N]
-            return E_coll
-        
-        else:
-            return NotImplementedError("Expected log-likelihood calculation implemented only using \
-                                       Gauss-Hermite Quadrature or Monte Carlo")
+            raise NotImplementedError(
+                "Expected log-likelihood calculation implemented only using Gauss-Hermite Quadrature or Monte Carlo"
+            )
 
     def _log_prob(self, F, Y):
         raise NotImplementedError("PlanningLikelihood does not define pointwise log_prob.")

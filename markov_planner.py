@@ -10,7 +10,7 @@ from vgpmp.kernels import GaussMarkovKernel
 from vgpmp.likelihood import PlanningLikelihood
 from vgpmp.posterior import GaussMarkovPosterior
 from vgpmp.models.markov_vgp import MarkovVGP
-from vgpmp.utils.plotting import plot_mean_and_obstacle
+from vgpmp.utils.plotting import plot_mean_and_obstacle, visualize_initial_traj
 
 """
 Notation:
@@ -21,13 +21,12 @@ Notation:
 gpflow.config.set_default_float(tf.float64)
 gpflow.config.set_default_jitter(1e-6)
 
+
 # TODO: implement natural gradients
-
-
 @tf.function
 def optimization_step(model, closure, optimizer):
     with tf.GradientTape() as tape:
-        tape.watch(model.trainable_variables)
+        # tape.watch(model.trainable_variables)
         loss = closure()
 
     grads = tape.gradient(loss, model.trainable_variables)
@@ -61,7 +60,7 @@ if __name__=="__main__":
     '''Model'''
     dynamics = ConstantVelocityModel(
         dof=dof,
-        acceleration_noise=1e-3,
+        acceleration_noise=5.0,
     )
 
     kernel = GaussMarkovKernel(
@@ -69,17 +68,24 @@ if __name__=="__main__":
         dynamics=dynamics,
         anchor_vars=tf.constant([1e-5, 1e-5, 1e-3, 1e-3], dtype=default_float())
     )
+
     mean = dynamics.initate_traj(
         times=X_data,
         start=start,
         goal=goal
     )
+    # visualize_initial_traj(
+    #     X_data,
+    #     dynamics,
+    #     mean,
+    # )
 
-    # Build likelihood for a single circular obstacle centered at (5, 5) with radius 2.0
+    # Build likelihood for a single circular obstacle
     likelihood = PlanningLikelihood(
         dof=dof,
-        obstacle_center=(5.0, 5.0),
-        obstacle_radius=2.0,
+        obstacle_center=(6.0, 4.0),
+        obstacle_radius=1.0,
+        desired_nominal=mean,
         grid_size=10.0,
         epsilon=0.1,
         sigma_obs=0.10,
@@ -102,8 +108,8 @@ if __name__=="__main__":
     #TODO: set trainable parameters and assign appropriate priors to them
 
     '''Training loop'''
-    num_steps = 10
-    optimizer = tf.optimizers.Adam(learning_rate=0.1, beta_1=0.8, beta_2=0.95)
+    num_steps = 1000
+    optimizer = tf.optimizers.Adam(learning_rate=0.03, beta_1=0.8, beta_2=0.95)
     closure = model.training_loss_closure()
     step_iterator = tqdm(range(num_steps))
 
@@ -129,13 +135,13 @@ if __name__=="__main__":
     ## Posterior mean and variance plot
     plot_mean_and_obstacle(
         X_query=X_test,
-        K_cholesky=kernel.K_cholesky,
+        K_prior=kernel.K,
         model=model,
         posterior=posterior,
-        obstacle_center=(5.0, 5.0),
-        obstacle_radius=2.0,
-        epsilon=0.1,
-        grid_size=10.0
+        obstacle_center=likelihood.center,
+        obstacle_radius=likelihood.radius,
+        epsilon=likelihood.epsilon,
+        grid_size=likelihood.grid_size
     )
 
 

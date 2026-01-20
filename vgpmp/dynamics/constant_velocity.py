@@ -1,118 +1,132 @@
 import tensorflow as tf
 from gpflow.config import default_float
 
-class ConstantVelocityModel():
+class ConstantVelocityModel:
     r"""
-    The constant velocity LTV-SDE model is represented as:
-    :math: `\dot{x}(t) = A(t)x(t) + u(t) + F(t)w(t)`
-    where,
-    :math: `A = [0 I; 0 0], \quad F = [0;I],`
-    and :math: `w(t)` is white noise.
+    Constant velocity SDE:
+        xdot = A x + F w
+    with A = [[0, I],
+              [0, 0]],
+         F = [[0],
+              [I]],
+    and w(t) white noise on acceleration.
     """
-    def __init__(self, dof: int, acceleration_noise: float = 1.0):
-        self.dof = dof
-        self.P = 2*self.dof 
-        
-        self.acceleration_noise = acceleration_noise
 
+    def __init__(self, dof: int, acceleration_noise: float = 1.0):
+        self.dof = int(dof)
+        self.P = 2 * self.dof
+        self.acceleration_noise = tf.convert_to_tensor(acceleration_noise, dtype=default_float())
+
+        # Convenience (2D) blocks
         self.Z = tf.zeros([self.dof, self.dof], dtype=default_float())
         self.I = tf.eye(self.dof, dtype=default_float())
 
     @property
     def state_dimension(self):
         return self.P
-    
-    @property
-    def num_times(self):
-        return self.N
-    
-    def _system_matrices(self, times: tf.Tensor):
-        N = int(times.shape[0])
-        A = tf.concat([
-            tf.concat([self.Z, self.I], axis=1),
-            tf.concat([self.Z, self.Z], axis=1)
-        ], axis=0)                                                      # shape (P, P)
 
-        F = tf.concat([
-            tf.zeros([self.dof, self.dof], dtype=default_float()), self.I
-        ], axis=0)                                                      # shape (P, dof)
+    def get_transition_matrices(self, dt: tf.Tensor) -> tf.Tensor:
+        """
+        dt: (B,) or scalar
+        returns: (B, P, P) or (P,P) if scalar input
+        """
+        dt = tf.convert_to_tensor(dt, dtype=default_float())
+        squeeze_back = (dt.shape.rank == 0)
 
-        Qc = self.q_acc*tf.eye(self.dof, dtype=default_float())         # shape (dof, dof)
-        v = tf.zeros([self.D], default_float())                         # shape (P,)
+        dt = tf.reshape(dt, [-1])  # (B,)
+        B = tf.shape(dt)[0]
 
-        # replicate for each time-step
-        A_list  = [A for _ in range(self.N)]
-        F_list  = [F for _ in range(self.N)]
-        Qc_list = [Qc for _ in range(self.N)]
-        v_list  = [v for _ in range(self.N)]
+        I = self.I[None, :, :]  # (1,dof,dof)
+        Z = self.Z[None, :, :]  # (1,dof,dof)
 
-        return A_list, F_list, Qc_list, v_list, self.D
-    
-    def _transition_matrix(self, dt: tf.Tensor):
-        Phi = tf.concat(
-            [
-                tf.concat([self.I, dt * self.I], axis=1),
-                tf.concat([self.Z, self.I], axis=1),
-            ],
-            axis=0,
-        ) 
+        dtI = dt[:, None, None] * I  # (B,dof,dof)
+
+        top = tf.concat([tf.broadcast_to(I, [B, self.dof, self.dof]), dtI], axis=2)  # (B,dof,2dof)
+        bot = tf.concat([tf.broadcast_to(Z, [B, self.dof, self.dof]),
+                         tf.broadcast_to(I, [B, self.dof, self.dof])], axis=2)       # (B,dof,2dof)
+        Phi = tf.concat([top, bot], axis=1)  # (B,2dof,2dof) = (B,P,P)
+
+        if squeeze_back:
+            return Phi[0]
         return Phi
-    
-    def _noise_matrix(self, dt):
-        Qqq = (dt**3) / 3.0
-        Qqv = (dt**2) / 2.0
-        Qvv = dt
 
-        Q = self.acceleration_noise * tf.concat(
-            [
-                tf.concat([Qqq * self.I, Qqv * self.I], axis=1),
-                tf.concat([Qqv * self.I, Qvv * self.I], axis=1),
-            ],
-            axis=0,
-        )
+    def get_noise_matrices(self, dt: tf.Tensor) -> tf.Tensor:
+        """
+        Discrete-time process noise covariance for white-noise acceleration.
+        dt: (B,) or scalar
+        returns: (B,P,P) or (P,P) if scalar input
+        """
+        dt = tf.convert_to_tensor(dt, dtype=default_float())
+        squeeze_back = (dt.shape.rank == 0)
+
+        dt = tf.reshape(dt, [-1])  # (B,)
+        B = tf.shape(dt)[0]
+
+        Qqq = (dt ** 3) / tf.cast(3.0, dt.dtype)   # (B,)
+        Qqv = (dt ** 2) / tf.cast(2.0, dt.dtype)   # (B,)
+        Qvv = dt                                    # (B,)
+
+        I = self.I[None, :, :]  # (1,dof,dof)
+        I = tf.broadcast_to(I, [B, self.dof, self.dof])
+
+        QqqI = Qqq[:, None, None] * I
+        QqvI = Qqv[:, None, None] * I
+        QvvI = Qvv[:, None, None] * I
+
+        top = tf.concat([QqqI, QqvI], axis=2)  # (B,dof,2dof)
+        bot = tf.concat([QqvI, QvvI], axis=2)  # (B,dof,2dof)
+        Q = tf.concat([top, bot], axis=1)      # (B,2dof,2dof)
+
+        Q = self.acceleration_noise * Q
+
+        if squeeze_back:
+            return Q[0]
         return Q
-    
-    # TODO
-    def _inverse_noise_matrix(self, dt):
-        #TODO: handle dt=0.0
-        Qqq = 12.0 * (1 / dt**3)
-        Qqv = -6.0 * (1 / dt**2)
-        Qvv = 4 * (1 / dt)
 
-        Q = (1 / self.acceleration_noise) * tf.concat(
-            [
-                tf.concat([Qqq * self.I, Qqv * self.I], axis=1),
-                tf.concat([Qqv * self.I, Qvv * self.I], axis=1),
-            ],
-            axis=0,
-        )
-        return Q 
-    
-    def get_transition_matrices(self, dt: tf.Tensor):
-        Phis = []
-        for k in range(dt.shape[0]):
-            Phi_k = self._transition_matrix(dt[k])           # shape (P, P)
-            Phis.append(Phi_k)
-        return Phis
-    
-    def get_noise_matrices(self, dt: tf.Tensor):
-        Qs = []
-        for k in range(dt.shape[0]):
-            Q_k = self._noise_matrix(dt[k])                  # shape (P, P)
-            Qs.append(Q_k)
-        return Qs
-    
-    def get_inverse_noise_matrices(self, dt: tf.Tensor):
-        Qs_inv = []
-        for k in range(dt.shape[0]):
-            Q_k_inv = self._noise_matrix(dt[k])             # shape (P, P)
-            Qs_inv.append(Q_k_inv)
-        return Qs_inv
-    
-    def get_control_vectors(self, dt: tf.Tensor):
-        # considering zero initial controls
-        return [tf.zeros([self.P], dtype=default_float()) for _ in range(dt.shape[0])]
-    
+    def get_inverse_noise_matrices(self, dt: tf.Tensor, eps: float = 1e-12) -> tf.Tensor:
+        """
+        Inverse of the discrete-time process noise covariance (for dt>0).
+        dt: (B,) or scalar
+        returns: (B,P,P) or (P,P) if scalar input
+        """
+        dt = tf.convert_to_tensor(dt, dtype=default_float())
+        squeeze_back = (dt.shape.rank == 0)
+
+        dt = tf.reshape(dt, [-1])  # (B,)
+        B = tf.shape(dt)[0]
+
+        dt_safe = tf.maximum(dt, tf.cast(eps, dt.dtype))
+
+        Qqq = tf.cast(12.0, dt.dtype) / (dt_safe ** 3)   # (B,)
+        Qqv = -tf.cast(6.0, dt.dtype) / (dt_safe ** 2)   # (B,)
+        Qvv = tf.cast(4.0, dt.dtype) / dt_safe           # (B,)
+
+        I = self.I[None, :, :]
+        I = tf.broadcast_to(I, [B, self.dof, self.dof])
+
+        QqqI = Qqq[:, None, None] * I
+        QqvI = Qqv[:, None, None] * I
+        QvvI = Qvv[:, None, None] * I
+
+        top = tf.concat([QqqI, QqvI], axis=2)
+        bot = tf.concat([QqvI, QvvI], axis=2)
+        Qinv = tf.concat([top, bot], axis=1)  # (B,P,P)
+
+        Qinv = (tf.cast(1.0, dt.dtype) / self.acceleration_noise) * Qinv
+
+        if squeeze_back:
+            return Qinv[0]
+        return Qinv
+
+    def get_control_vectors(self, dt: tf.Tensor) -> tf.Tensor:
+        """
+        returns: (B,P)
+        """
+        dt = tf.convert_to_tensor(dt, dtype=default_float())
+        dt = tf.reshape(dt, [-1])
+        B = tf.shape(dt)[0]
+        return tf.zeros([B, self.P], dtype=default_float())
+
     def initate_traj(self, times, start, goal, method: str = ""):
         start = tf.convert_to_tensor(start, default_float())        # shape (P,)
         goal = tf.convert_to_tensor(goal, default_float())
@@ -124,12 +138,10 @@ class ConstantVelocityModel():
         T = times[-1] - times[0]
         w = (times - times[0]) / T                                  # shape (N,1)
 
-        positions = start_pos + w * (goal_pos - start_pos)          # shape (N,dof)    
+        positions = start_pos + w * (goal_pos - start_pos)          # shape (N,dof)
 
-        v_mid = (positions[2:] - positions[:-2]) / (times[2:] - times[:-2])       # shape (N-2,dof)
-        zeros = tf.zeros((1,self.dof), dtype=default_float())
-        velocities = tf.concat([zeros, v_mid, zeros], axis=0)                     # shape (N,dof)
+        v_mid = (positions[2:] - positions[:-2]) / (times[2:] - times[:-2])  # (N-2,dof)
+        zeros = tf.zeros((1, self.dof), dtype=default_float())
+        velocities = tf.concat([zeros, v_mid, zeros], axis=0)                  # (N,dof)
 
-        return tf.concat([positions, velocities], axis=1)                         # shape (N,P)
-
-    
+        return tf.concat([positions, velocities], axis=1)                      # (N,P)
