@@ -49,9 +49,7 @@ if __name__=="__main__":
     num_interior_points = 9
     # times
     t = np.linspace(t0, tN, num_interior_points + 2)
-    X_data = t.reshape(-1, 1).astype(np.float64)         # shape (N,1)
-    # dummy Y_data
-    Y_data = tf.zeros([num_interior_points + 2, 2*dof], dtype=default_float())
+    X_data = t.reshape(-1, 1).astype(np.float64)         # shape (N+1,1)
 
     '''Test Data'''
     num_query_points = 20
@@ -69,7 +67,7 @@ if __name__=="__main__":
         anchor_vars=tf.constant([1e-5, 1e-5, 1e-3, 1e-3], dtype=default_float())
     )
 
-    mean = dynamics.initate_traj(
+    Y_data = dynamics.initate_traj(
         times=X_data,
         start=start,
         goal=goal
@@ -83,12 +81,13 @@ if __name__=="__main__":
     # Build likelihood for a single circular obstacle
     likelihood = PlanningLikelihood(
         dof=dof,
-        obstacle_center=(6.0, 4.0),
-        obstacle_radius=1.0,
-        desired_nominal=mean,
+        desired_nominal=Y_data,
+        obstacle_center=(6.0, 4.5),
+        obstacle_radius=2.0,
         grid_size=10.0,
         epsilon=0.1,
-        sigma_obs=0.10,
+        sigma_obs=0.02,
+        sigma_nominal=0.8,
     )
 
     posterior = GaussMarkovPosterior(
@@ -98,7 +97,6 @@ if __name__=="__main__":
 
     model = MarkovVGP(
         data=(X_data, Y_data),
-        mean=mean,
         kernel=kernel,
         likelihood=likelihood,
         posterior=posterior,
@@ -108,8 +106,8 @@ if __name__=="__main__":
     #TODO: set trainable parameters and assign appropriate priors to them
 
     '''Training loop'''
-    num_steps = 1000
-    optimizer = tf.optimizers.Adam(learning_rate=0.03, beta_1=0.8, beta_2=0.95)
+    num_steps = 100
+    optimizer = tf.optimizers.Adam(learning_rate=0.05, beta_1=0.8, beta_2=0.95)
     closure = model.training_loss_closure()
     step_iterator = tqdm(range(num_steps))
 

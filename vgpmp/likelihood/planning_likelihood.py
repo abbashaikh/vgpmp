@@ -22,15 +22,15 @@ class PlanningLikelihood:
     """
     def __init__(
         self,
-        dof: int = 2,
+        dof: int,
+        desired_nominal,
         obstacle_center=(5.0, 5.0),
         obstacle_radius=2.0,
-        desired_nominal=None,
         grid_size=10.0,
         epsilon: float = 0.1,
-        sigma_obs: float = 0.2,
         hinge_softness: float = 0.5,
-
+        sigma_obs: float = 0.02,
+        sigma_nominal: float = 0.8,
     ):
         self.dof = dof
 
@@ -44,8 +44,8 @@ class PlanningLikelihood:
         self.enforce_box = False
         self.sigma_box = tf.constant(0.1, dtype=default_float())
 
-        self.sigma_nominal = tf.constant(0.4, dtype=default_float())
-        self.tracking_weight = tf.constant(5.0, dtype=default_float())
+        self.sigma_nominal = tf.constant(sigma_nominal, dtype=default_float())
+        self.tracking_weight = tf.constant(1.0, dtype=default_float())
         self.desired_nominal  = None if desired_nominal  is None else tf.constant(desired_nominal,  dtype=default_float())
 
     def _hinge(self, x: tf.Tensor) -> tf.Tensor:
@@ -90,39 +90,6 @@ class PlanningLikelihood:
             box = tf.zeros_like(coll)
 
         return coll + box
-
-    def _expected_boundary_penalty(self, fmean: tf.Tensor, fvar: Covariance) -> tf.Tensor:
-        """
-        Returns per-time penalty vector shape (N,) with nonzero entries only at k=1 and k=N-2.
-
-        Uses exact identity:
-        E[||X-a||^2] = ||mu-a||^2 + tr(Sigma)
-        for X ~ N(mu, Sigma), using only marginal S_kk.
-        """
-        N = tf.shape(fmean)[0]
-
-        penalties = tf.zeros([N], dtype=default_float())
-
-        # position mean/cov
-        mu_xy = fmean[:, :self.dof]                # (N,dof)
-        S_xy = fvar.diags[:, :self.dof, :self.dof] # (N,dof,dof)
-        tr_S = tf.linalg.trace(S_xy)               # (N,)
-
-        # start penalty at k=1
-        if self.desired_start is not None:
-            diff1 = mu_xy[1] - self.desired_start           # (dof,)
-            e_sq1 = tf.reduce_sum(diff1 * diff1) + tr_S[1]                  # scalar
-            p1 = self.boundary_weight * (e_sq1 / (self.sigma_start ** 2))   # scalar
-            penalties = tf.tensor_scatter_nd_add(penalties, indices=[[1]], updates=[p1])
-
-        # goal penalty at k=N-2
-        if self.desired_goal is not None:
-            diffN = mu_xy[N - 2] - self.desired_goal
-            e_sqN = tf.reduce_sum(diffN * diffN) + tr_S[N - 2]
-            pN = self.boundary_weight * (e_sqN / (self.sigma_goal ** 2))
-            penalties = tf.tensor_scatter_nd_add(penalties, indices=[[N - 2]], updates=[pN])
-
-        return penalties
     
     def _expected_nominal_tracking_penalty(
         self,
@@ -243,7 +210,7 @@ class PlanningLikelihood:
             E_coll = tf.reduce_sum(coll * W2[None, :, :], axis=(1, 2))      # (N,)
             E_track = self._expected_nominal_tracking_penalty(fmean, fvar)
 
-            return E_coll + E_track
+            return - (E_coll + E_track)
 
         elif method == "monte_carlo":
             fsamples = self._sample_posterior(fmean, fvar, nsamples)  # (S,N,P)
@@ -259,7 +226,7 @@ class PlanningLikelihood:
             E_coll = tf.reduce_mean(coll, axis=0)                         # (N,)
             E_track = self._expected_nominal_tracking_penalty(fmean, fvar)
 
-            return E_coll + E_track
+            return - (E_coll + E_track)
 
         else:
             raise NotImplementedError(

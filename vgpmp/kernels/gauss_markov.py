@@ -38,12 +38,11 @@ class GaussMarkovKernel:
         self.K0_inv = tf.linalg.cholesky_solve(self.K0_chol, self.I)
         self.KN_inv = None
 
-        ## Dynamics matrices
-        # TODO: get_matrices now return tensors and not lists
-        self.Phi = dynamics.get_transition_matrices(self.dt)  # length N-1, each (P,P)
-        self.Q = [Qi for Qi in dynamics.get_noise_matrices(self.dt)]  # length N-1
-        self.Qinv = [Qinv_i for Qinv_i in dynamics.get_inverse_noise_matrices(self.dt)]  # length N-1
-        self.u = dynamics.get_control_vectors(self.dt)  # length N-1, each (P,)
+        ## Dynamics matrices: (N,P,P)
+        self.Phi = dynamics.get_transition_matrices(self.dt)
+        self.Q = dynamics.get_noise_matrices(self.dt)
+        self.Qinv = dynamics.get_inverse_noise_matrices(self.dt)
+        self.u = dynamics.get_control_vectors(self.dt)
 
         # Precision matrix blocks
         self.Kinv = self._build_Kinv_blocks()
@@ -135,7 +134,7 @@ class GaussMarkovKernel:
 
         return BlockTriDiagMatrix(diags=diags_ta.stack(), sub_diags=sub_ta.stack())
 
-    def _build_covariance_from_precision(self, J: BlockTriDiagMatrix) -> "BlockTriDiagCovariance":
+    def _build_covariance_from_precision(self, J: BlockTriDiagMatrix) -> BlockTriDiagCovariance:
         """
         Convert precision J (block tri-diagonal) into covariance K = J^{-1}, returning
         ONLY the block-tridiagonal part of K:
