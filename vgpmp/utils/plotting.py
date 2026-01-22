@@ -126,9 +126,11 @@ def plot_mean_and_obstacle(
         model,
         posterior,
         nominal,
-        obstacles,
-        epsilon,
-        grid_size,
+        obstacles=None,
+        obstacle_centers_over_time=None,
+        obstacle_radii_over_time=None,
+        epsilon=0.0,
+        grid_size=10.0,
     ):
     # ----- Evaluate GP posterior at query points -----
     dof = posterior.dynamics.dof
@@ -152,7 +154,7 @@ def plot_mean_and_obstacle(
 
     ax.plot(x_nom, y_nom, linestyle="--", linewidth=2, label="Nominal trajectory")
 
-    # covairance ellipses
+    # covariance ellipses
     first_ellipse = True
     for i in range(0, len(x_mean), 1):
         cov = variance[i, :dof, :dof]       # (dof, dof)
@@ -167,33 +169,62 @@ def plot_mean_and_obstacle(
         first_ellipse = False
 
     # Obstacle circle and (optional) safety buffer R+epsilon
-    # obstacles + safety buffers
     first_obs = True
     first_buf = True
-    for (center, radius) in obstacles:
-        cx, cy = center
 
-        circle = Circle(
-            (cx, cy),
-            radius,
-            color="red",
-            alpha=0.25,
-            label="Obstacle" if first_obs else None,
-        )
-        buffer = Circle(
-            (cx, cy),
-            radius + float(epsilon),
-            fill=False,
-            linestyle="--",
-            alpha=0.7,
-            color="red",
-            label="Radius + epsilon" if first_buf else None,
-        )
-        ax.add_patch(circle)
-        ax.add_patch(buffer)
+    if obstacle_centers_over_time is not None and obstacle_radii_over_time is not None:
+        centers_t = np.asarray(obstacle_centers_over_time)
+        radii_t = np.asarray(obstacle_radii_over_time)
+        T = min(len(x_mean), centers_t.shape[0])
+        for i in range(T):
+            for m in range(centers_t.shape[1]):
+                cx, cy = centers_t[i, m]
+                radius = radii_t[i, m]
+                circle = Circle(
+                    (cx, cy),
+                    radius,
+                    color="red",
+                    alpha=0.12,
+                    label="Obstacle" if first_obs else None,
+                )
+                buffer = Circle(
+                    (cx, cy),
+                    radius + float(epsilon),
+                    fill=False,
+                    linestyle="--",
+                    alpha=0.4,
+                    color="red",
+                    label="Radius + epsilon" if first_buf else None,
+                )
+                ax.add_patch(circle)
+                ax.add_patch(buffer)
+                first_obs = False
+                first_buf = False
+    elif obstacles is not None:
+        for (center, radius) in obstacles:
+            cx, cy = center
 
-        first_obs = False
-        first_buf = False
+            circle = Circle(
+                (cx, cy),
+                radius,
+                color="red",
+                alpha=0.25,
+                label="Obstacle" if first_obs else None,
+            )
+            buffer = Circle(
+                (cx, cy),
+                radius + float(epsilon),
+                fill=False,
+                linestyle="--",
+                alpha=0.7,
+                color="red",
+                label="Radius + epsilon" if first_buf else None,
+            )
+            ax.add_patch(circle)
+            ax.add_patch(buffer)
+
+            first_obs = False
+            first_buf = False
 
     ax.set_xlim(-5, grid_size+5)
     ax.set_ylim(-5, grid_size+5)

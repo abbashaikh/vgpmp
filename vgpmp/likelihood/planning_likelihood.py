@@ -1,4 +1,4 @@
-from typing import List, Tuple, Sequence
+from typing import Tuple, Sequence
 
 import numpy as np
 import tensorflow as tf
@@ -22,23 +22,33 @@ class PlanningLikelihood:
         self,
         dof: int,
         desired_nominal,
-        obstacles: Sequence[Tuple[Tuple[float, float], float]],
+        obstacles: Sequence[Tuple[Tuple[float, float], float]] = None,
+        obstacle_centers_over_time=None,
+        obstacle_radii_over_time=None,
+        support_times=None,
         grid_size=10.0,
         epsilon: float = 0.1,
         hinge_softness: float = 0.5,
         sigma_obs: float = 0.02,
         sigma_nominal: float = 0.8,
     ):
-        if len(obstacles) == 0:
-            raise ValueError("At least one obstacle must be provided.")
-        
+        if obstacles is None and (obstacle_centers_over_time is None or obstacle_radii_over_time is None):
+            raise ValueError("Provide either static `obstacles` or time-varying `obstacle_centers_over_time` and `obstacle_radii_over_time`.")
+
         self.dof = dof
         self.grid_size = tf.constant(grid_size, dtype=default_float())
-        
-        centers = [c for (c, _) in obstacles]
-        radii   = [r for (_, r) in obstacles]
-        self.obstacle_centers = tf.constant(centers, dtype=default_float())  # (M, dof)
-        self.obstacle_radii   = tf.constant(radii,   dtype=default_float())  # (M,)
+
+        self.time_varying = obstacle_centers_over_time is not None
+        if self.time_varying:
+            self.obstacle_centers_over_time = tf.convert_to_tensor(obstacle_centers_over_time, dtype=default_float())  # (N,M,dof)
+            self.obstacle_radii_over_time = tf.convert_to_tensor(obstacle_radii_over_time, dtype=default_float())      # (N,M)
+            self.support_times = None if support_times is None else tf.convert_to_tensor(support_times, dtype=default_float())
+        else:
+            centers = [c for (c, _) in obstacles]
+            radii   = [r for (_, r) in obstacles]
+            self.obstacle_centers = tf.constant(centers, dtype=default_float())  # (M, dof)
+            self.obstacle_radii   = tf.constant(radii,   dtype=default_float())  # (M,)
+            self.support_times = None
 
         self.epsilon = tf.constant(epsilon, dtype=default_float())
         self.sigma_obs = tf.constant(sigma_obs, dtype=default_float())
@@ -54,15 +64,44 @@ class PlanningLikelihood:
         s = tf.cast(self.hinge_softness, x.dtype)
         return tf.nn.softplus(x / s) * s
 
-    def _circles_signed_distance(self, Pxy: tf.Tensor) -> tf.Tensor:
+    def _obstacle_params(self, N: tf.Tensor, dtype) -> Tuple[tf.Tensor, tf.Tensor]:
         """
-        Pxy: [S, K, dof] or [N, K, K, dof] or [S, N, dof]
-        Returns:
-          sdist: [..., M] signed distances to each circle, positive outside.
+        Returns centers and radii shaped to match N support points.
+        centers: (N,M,dof), radii: (N,M)
         """
-        diff = Pxy[..., None, :] - self.obstacle_centers[None, ...]  # [..., M, dof]
-        d = tf.norm(diff, axis=-1)                                   # [..., M]
-        return d - self.obstacle_radii[None, :]                      # [..., M]
+        if self.time_varying:
+            centers = tf.cast(self.obstacle_centers_over_time, dtype)
+            radii = tf.cast(self.obstacle_radii_over_time, dtype)
+            centers = centers[:N]
+            radii = radii[:N]
+
+            def _pad(arr, target_len):
+                pad_len = target_len - tf.shape(arr)[0]
+                return tf.cond(
+                    pad_len > 0,
+                    lambda: tf.concat([arr, tf.repeat(arr[-1][None, ...], repeats=pad_len, axis=0)], axis=0),
+                    lambda: arr,
+                )
+
+            centers = _pad(centers, N)
+            radii = _pad(radii, N)
+        else:
+            centers = tf.cast(self.obstacle_centers[None, ...], dtype)  # (1,M,dof)
+            radii = tf.cast(self.obstacle_radii[None, ...], dtype)      # (1,M)
+            centers = tf.repeat(centers, repeats=N, axis=0)
+            radii = tf.repeat(radii, repeats=N, axis=0)
+        return centers, radii
+
+    def _circles_signed_distance(self, Pxy: tf.Tensor, centers: tf.Tensor, radii: tf.Tensor) -> tf.Tensor:
+        """
+        Returns signed distances to each circle, positive outside.
+        Pxy: [..., dof]
+        centers: [..., M, dof]
+        radii: [..., M]
+        """
+        diff = Pxy[..., None, :] - centers  # [..., M, dof]
+        d = tf.norm(diff, axis=-1)          # [..., M]
+        return d - radii                    # [..., M]
 
     def _box_violation(self, Pxy: tf.Tensor) -> tf.Tensor:
         x = Pxy[..., 0]
@@ -81,7 +120,10 @@ class PlanningLikelihood:
         Pxy = fsamp[..., :self.dof]
         Pxy = tf.cast(Pxy, dtype=fsamp.dtype)
 
-        sdist = self._circles_signed_distance(Pxy)  # [S,K,M]
+        centers, radii = self._obstacle_params(tf.shape(Pxy)[1], Pxy.dtype)
+        centers = centers[None, ...]
+        radii = radii[None, ...]
+        sdist = self._circles_signed_distance(Pxy, centers, radii)  # [S,K,M]
         penetration = self._hinge(tf.cast(self.epsilon, dtype=fsamp.dtype) - sdist)
         # coll per obstacle: [S, K, M] -> sum over M => [S, K]
         coll = tf.reduce_sum((penetration / self.sigma_obs) ** 2, axis=-1)
@@ -180,6 +222,7 @@ class PlanningLikelihood:
         """
         fmean = tf.convert_to_tensor(fmean)
         N = tf.shape(fmean)[0]
+        centers, radii = self._obstacle_params(N, fmean.dtype)
 
         if method == "gauss_hermite":
             xi, wi = self._gauss_hermite_params(order)  # (K,), (K,)
@@ -194,8 +237,11 @@ class PlanningLikelihood:
             f = tf.einsum("nij,klj->nkli", Cxy, Z)
             f = fmean[:, None, None, :self.dof] + tf.cast(SQRT_TWO, fmean.dtype) * f
 
+            centers_exp = centers[:, None, None, :, :]  # (N,1,1,M,dof)
+            radii_exp = radii[:, None, None, :]         # (N,1,1,M)
+
             # sdist: (N,K,K,M)
-            sdist = self._circles_signed_distance(f)
+            sdist = self._circles_signed_distance(f, centers_exp, radii_exp)
 
             s = tf.cast(self.hinge_softness, fmean.dtype)
             penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s   # (N,K,K,M)
@@ -212,8 +258,11 @@ class PlanningLikelihood:
             fsamples = self._sample_posterior(fmean, fvar, nsamples)  # (S,N,P)
             Pxy = fsamples[..., :self.dof]                            # (S,N,dof)
 
+            centers_exp = centers[None, ...]  # (1,N,M,dof)
+            radii_exp = radii[None, ...]      # (1,N,M)
+
             # sdist: (S,N,M)
-            sdist = self._circles_signed_distance(Pxy)
+            sdist = self._circles_signed_distance(Pxy, centers_exp, radii_exp)
 
             s = tf.cast(self.hinge_softness, fmean.dtype)
             penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s   # (S,N,M)
