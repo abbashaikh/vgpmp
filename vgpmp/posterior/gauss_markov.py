@@ -108,4 +108,3 @@ class GaussMarkovPosterior:
         var = tf.where(right_mask[:, None, None], varN, var)
 
         return mu, var
-

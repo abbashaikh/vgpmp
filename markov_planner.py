@@ -23,16 +23,16 @@ gpflow.config.set_default_jitter(1e-6)
 
 
 # TODO: implement natural gradients
+
 @tf.function
-def optimization_step(model, closure, optimizer):
+def optimization_step(model, closure, optimizer, nsamples: int = 8):
     with tf.GradientTape() as tape:
-        # tape.watch(model.trainable_variables)
         loss = closure()
+        sum_var_exp, KL, elbo = model.elbo_terms(nsamples=nsamples)
 
     grads = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
-
-    return loss
+    return loss, sum_var_exp, KL, elbo
 
 
 if __name__=="__main__":
@@ -78,12 +78,15 @@ if __name__=="__main__":
     #     mean,
     # )
 
-    # Build likelihood for a single circular obstacle
+    # Build likelihood for circular obstacles
+    obstacles = [
+        ((7.0, 7.0), 1.0),
+        # ((3.0, 4.0), 1.0),
+    ]
     likelihood = PlanningLikelihood(
         dof=dof,
         desired_nominal=Y_data,
-        obstacle_center=(6.0, 4.5),
-        obstacle_radius=2.0,
+        obstacles=obstacles,
         grid_size=10.0,
         epsilon=0.1,
         sigma_obs=0.02,
@@ -106,14 +109,32 @@ if __name__=="__main__":
     #TODO: set trainable parameters and assign appropriate priors to them
 
     '''Training loop'''
-    num_steps = 100
-    optimizer = tf.optimizers.Adam(learning_rate=0.05, beta_1=0.8, beta_2=0.95)
+    num_steps = 250
+    optimizer = tf.optimizers.Adam(learning_rate=0.01, beta_1=0.8, beta_2=0.95)
     closure = model.training_loss_closure()
-    step_iterator = tqdm(range(num_steps))
 
-    for _ in step_iterator:
-        loss = optimization_step(model, closure, optimizer)
+    step_iterator = tqdm(range(num_steps))
+    for step in step_iterator:
+        loss, sum_var_exp, KL, elbo = optimization_step(model, closure, optimizer, nsamples=8)
+
+        # tqdm postfix every step (lightweight)
         step_iterator.set_postfix_str(f"ELBO: {-loss:.3e}")
+
+        # detailed print every 10 steps
+        if step % 10 == 0:
+            # Convert to python floats for clean printing
+            loss_v = float(loss.numpy())
+            elbo_v = float(elbo.numpy())
+            kl_v = float(KL.numpy())
+            ve_v = float(sum_var_exp.numpy())
+
+            print(
+                f"[step {step:04d}] "
+                f"loss={loss_v:.6e}  "
+                f"ELBO={elbo_v:.6e}  "
+                f"sum_var_exp={ve_v:.6e}  "
+                f"KL={kl_v:.6e}"
+            )
 
     # opt = tf.keras.optimizers.Adam(learning_rate=1e-2)
     # for it in range(1000):
@@ -136,8 +157,8 @@ if __name__=="__main__":
         K_prior=kernel.K,
         model=model,
         posterior=posterior,
-        obstacle_center=likelihood.center,
-        obstacle_radius=likelihood.radius,
+        nominal=Y_data,
+        obstacles=obstacles,
         epsilon=likelihood.epsilon,
         grid_size=likelihood.grid_size
     )

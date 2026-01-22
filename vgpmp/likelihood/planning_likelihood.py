@@ -1,11 +1,9 @@
-from typing import List
+from typing import List, Tuple, Sequence
 
 import numpy as np
 import tensorflow as tf
-import gpflow
 from gpflow.config import default_float, default_jitter
 
-from ..posterior import GaussMarkovPosterior
 from ..utils.linear_algebra import Covariance
 
 SQRT_PI = 1.77245385091
@@ -24,19 +22,23 @@ class PlanningLikelihood:
         self,
         dof: int,
         desired_nominal,
-        obstacle_center=(5.0, 5.0),
-        obstacle_radius=2.0,
+        obstacles: Sequence[Tuple[Tuple[float, float], float]],
         grid_size=10.0,
         epsilon: float = 0.1,
         hinge_softness: float = 0.5,
         sigma_obs: float = 0.02,
         sigma_nominal: float = 0.8,
     ):
+        if len(obstacles) == 0:
+            raise ValueError("At least one obstacle must be provided.")
+        
         self.dof = dof
-
-        self.center = tf.constant(obstacle_center, dtype=default_float())
-        self.radius = tf.constant(obstacle_radius, dtype=default_float())
         self.grid_size = tf.constant(grid_size, dtype=default_float())
+        
+        centers = [c for (c, _) in obstacles]
+        radii   = [r for (_, r) in obstacles]
+        self.obstacle_centers = tf.constant(centers, dtype=default_float())  # (M, dof)
+        self.obstacle_radii   = tf.constant(radii,   dtype=default_float())  # (M,)
 
         self.epsilon = tf.constant(epsilon, dtype=default_float())
         self.sigma_obs = tf.constant(sigma_obs, dtype=default_float())
@@ -52,17 +54,17 @@ class PlanningLikelihood:
         s = tf.cast(self.hinge_softness, x.dtype)
         return tf.nn.softplus(x / s) * s
 
-    def _circle_signed_distance(self, Pxy: tf.Tensor) -> tf.Tensor:
+    def _circles_signed_distance(self, Pxy: tf.Tensor) -> tf.Tensor:
         """
-        Pxy: [S, K, 2]; returns sdist: [S, K], positive outside circle.
+        Pxy: [S, K, dof] or [N, K, K, dof] or [S, N, dof]
+        Returns:
+          sdist: [..., M] signed distances to each circle, positive outside.
         """
-        d = tf.norm(Pxy - self.center, axis=-1)  # [S, K]
-        return d - self.radius
+        diff = Pxy[..., None, :] - self.obstacle_centers[None, ...]  # [..., M, dof]
+        d = tf.norm(diff, axis=-1)                                   # [..., M]
+        return d - self.obstacle_radii[None, :]                      # [..., M]
 
     def _box_violation(self, Pxy: tf.Tensor) -> tf.Tensor:
-        """
-        Pxy: [S, K, 2]; returns nonnegative violation per time: [S, K]
-        """
         x = Pxy[..., 0]
         y = Pxy[..., 1]
         L = self.grid_size
@@ -79,9 +81,10 @@ class PlanningLikelihood:
         Pxy = fsamp[..., :self.dof]
         Pxy = tf.cast(Pxy, dtype=fsamp.dtype)
 
-        sdist = self._circle_signed_distance(Pxy)  # [S,K]
+        sdist = self._circles_signed_distance(Pxy)  # [S,K,M]
         penetration = self._hinge(tf.cast(self.epsilon, dtype=fsamp.dtype) - sdist)
-        coll = (penetration / self.sigma_obs) ** 2
+        # coll per obstacle: [S, K, M] -> sum over M => [S, K]
+        coll = tf.reduce_sum((penetration / self.sigma_obs) ** 2, axis=-1)
 
         if self.enforce_box:
             vbox = self._box_violation(Pxy)
@@ -133,7 +136,6 @@ class PlanningLikelihood:
           S_kk = fvar.diags[k]
         Returns: C of shape (N,P,P)
         """
-        # This assumes fvar.diags is (N,P,P).
         Sdiag = fvar.diags  # (N,P,P)
         Sdiag = 0.5 * (Sdiag + tf.transpose(Sdiag, perm=[0, 2, 1]))
         Sdiag = Sdiag + default_jitter() * tf.eye(tf.shape(Sdiag)[1], dtype=Sdiag.dtype)[None, :, :]
@@ -178,34 +180,28 @@ class PlanningLikelihood:
         """
         fmean = tf.convert_to_tensor(fmean)
         N = tf.shape(fmean)[0]
-        P = tf.shape(fmean)[1]
 
         if method == "gauss_hermite":
             xi, wi = self._gauss_hermite_params(order)  # (K,), (K,)
             X1, X2 = tf.meshgrid(xi, xi, indexing="ij")  # (K,K)
             W2 = wi[:, None] * wi[None, :]               # (K,K)
+            Z = tf.stack([X1, X2], axis=-1)              # (K,K,2)
 
-            # Z: (K,K,2)
-            Z = tf.stack([X1, X2], axis=-1)
+            C = self._marginal_choleskies(fvar, N)       # (N,P,P)
+            Cxy = C[:, :self.dof, :self.dof]             # (N,dof,dof)
 
-            # C: (N,P,P) from marginal S_kk
-            C = self._marginal_choleskies(fvar, N)  # (N,P,P)
-
-            # Use only position dims (dof)
-            Cxy = C[:, :self.dof, :self.dof]  # (N,dof,dof)
-
-            # f = mu + sqrt(2) * Cxy @ z
-            # result: (N,K,K,dof)
+            # f: (N,K,K,dof)
             f = tf.einsum("nij,klj->nkli", Cxy, Z)
             f = fmean[:, None, None, :self.dof] + tf.cast(SQRT_TWO, fmean.dtype) * f
 
-            # Signed distance to circle
-            diff = f - self.center[None, None, None, :]          # (N,K,K,dof)
-            sdist = tf.norm(diff, axis=-1) - self.radius         # (N,K,K)
+            # sdist: (N,K,K,M)
+            sdist = self._circles_signed_distance(f)
 
             s = tf.cast(self.hinge_softness, fmean.dtype)
-            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s  # (N,K,K)
-            coll = (penetration / self.sigma_obs) ** 2                    # (N,K,K)
+            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s   # (N,K,K,M)
+
+            # coll: sum over obstacles => (N,K,K)
+            coll = tf.reduce_sum((penetration / self.sigma_obs) ** 2, axis=-1)
 
             E_coll = tf.reduce_sum(coll * W2[None, :, :], axis=(1, 2))      # (N,)
             E_track = self._expected_nominal_tracking_penalty(fmean, fvar)
@@ -216,14 +212,16 @@ class PlanningLikelihood:
             fsamples = self._sample_posterior(fmean, fvar, nsamples)  # (S,N,P)
             Pxy = fsamples[..., :self.dof]                            # (S,N,dof)
 
-            diff = Pxy - self.center[None, None, :]                   # (S,N,dof)
-            sdist = tf.norm(diff, axis=-1) - self.radius              # (S,N)
+            # sdist: (S,N,M)
+            sdist = self._circles_signed_distance(Pxy)
 
             s = tf.cast(self.hinge_softness, fmean.dtype)
-            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s  # (S,N)
-            coll = (penetration / self.sigma_obs) ** 2                    # (S,N)
+            penetration = tf.nn.softplus((self.epsilon - sdist) / s) * s   # (S,N,M)
 
-            E_coll = tf.reduce_mean(coll, axis=0)                         # (N,)
+            # coll: sum over obstacles => (S,N)
+            coll = tf.reduce_sum((penetration / self.sigma_obs) ** 2, axis=-1)
+
+            E_coll = tf.reduce_mean(coll, axis=0)                          # (N,)
             E_track = self._expected_nominal_tracking_penalty(fmean, fvar)
 
             return - (E_coll + E_track)

@@ -5,15 +5,18 @@ from gpflow import Parameter
 from gpflow.models import GPModel
 from gpflow.models.training_mixins import InternalDataTrainingLossMixin
 from gpflow.models.util import data_input_to_tensor
-from gpflow.config import default_float, default_jitter
+from gpflow.config import default_float
 
 from ..base import RegressionData, InputData, MeanAndVariance
 from ..kernels import GaussMarkovKernel
 from ..likelihood import PlanningLikelihood
 from ..kulback_liebler import gauss_markov_kl
 from ..posterior import GaussMarkovPosterior
-from ..utils.linear_algebra import BlockTriDiagCovariance, BlockBiDiagFactor, covariance_from_bidiag_factor
-from ..utils.math import softplus_inverse
+from ..utils.linear_algebra import (
+    BlockTriDiagCovariance, BlockBiDiagFactor,
+    invert_softplus_diag,
+    covariance_from_bidiag_factor, 
+)
 
 
 class MarkovVGP(GPModel, InternalDataTrainingLossMixin):
@@ -50,14 +53,13 @@ class MarkovVGP(GPModel, InternalDataTrainingLossMixin):
             raise ValueError("X_data must have static length to build MarkovVGP Parameters.")
         self.num_data = Parameter(static_num_data, shape=[], dtype=tf.int32, trainable=False)
 
-        # Variational mean: free mid points only (anchors clamped to Y endpoints)
+        # --- Variational mean: free mid points only (anchors clamped to Y endpoints) ---
         self.q_mean_free = Parameter(
             _Y_data[1:-1, :],
             shape=(static_num_data - 2, static_num_latent),
         )
 
-        # Variational covariance parameterization:
-
+        # --- Variational covariance parameterization ---
         # Trainable interior diag raw blocks for L: indices 1..N-2 (so count N-2).
         P_static = static_num_latent
         if P_static is None:
@@ -66,16 +68,9 @@ class MarkovVGP(GPModel, InternalDataTrainingLossMixin):
         mid_count = static_num_data - 2
         sub_count = static_num_data - 1
 
-        # Helper to undo the softplus used in _ensure_lower_with_positive_diag so that
-        # the transformed diagonal matches a target Cholesky block.
-        def _invert_softplus_diag(L_block: tf.Tensor) -> tf.Tensor:
-            d = tf.linalg.diag_part(L_block)
-            d_raw = softplus_inverse(tf.maximum(d, default_jitter()))
-            return L_block - tf.linalg.diag(d) + tf.linalg.diag(d_raw)
-
-        # Raw params for trainable mids
+        # # Raw params for trainable mids
         eye_block = tf.eye(P_static, dtype=default_float())
-        eye_raw = _invert_softplus_diag(eye_block)
+        eye_raw = invert_softplus_diag(eye_block)
         init_mid_raw = tf.tile(eye_raw[None, :, :], multiples=[mid_count, 1, 1])
         init_sub = tf.zeros((sub_count, P_static, P_static), dtype=default_float())
 
@@ -84,8 +79,8 @@ class MarkovVGP(GPModel, InternalDataTrainingLossMixin):
 
         # Fixed endpoint diag factors (raw, before softplus in _ensure_lower_with_positive_diag)
         anchor_chol = tf.linalg.diag(tf.sqrt(self.anchor_vars))  # (P,P)
-        self.L00_fixed_raw = _invert_softplus_diag(anchor_chol)  # (P,P)
-        self.LNN_fixed_raw = _invert_softplus_diag(anchor_chol)  # (P,P)
+        self.L00_fixed_raw = invert_softplus_diag(anchor_chol)  # (P,P)
+        self.LNN_fixed_raw = invert_softplus_diag(anchor_chol)  # (P,P)
 
         self.posterior = posterior
 
@@ -128,6 +123,27 @@ class MarkovVGP(GPModel, InternalDataTrainingLossMixin):
         )  # (N,)
 
         return tf.reduce_sum(var_exp) - KL
+    
+    def elbo_terms(self, nsamples: int = 8):
+        """
+        Returns:
+        sum_var_exp: scalar
+        KL: scalar
+        elbo: scalar (= sum_var_exp - KL)
+        """
+        KL = gauss_markov_kl(self.q_mean, self.q_cov, self.Kinv)
+
+        var_exp = self.likelihood.variational_expectations(
+            self.q_mean,
+            self.q_cov,
+            method="gauss_hermite",
+            order=10,
+            nsamples=nsamples,
+        )  # (N,)
+
+        sum_var_exp = tf.reduce_sum(var_exp)
+        elbo = sum_var_exp - KL
+        return sum_var_exp, KL, elbo
 
     def maximum_log_likelihood_objective(self) -> tf.Tensor:
         return self.elbo()

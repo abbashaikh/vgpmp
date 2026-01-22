@@ -4,9 +4,19 @@ import tensorflow as tf
 
 from gpflow.config import default_jitter
 
+from .math import softplus_inverse
+
 
 def sym(A: tf.Tensor) -> tf.Tensor:
     return 0.5 * (A + tf.transpose(A))
+
+
+# Helper to undo the softplus used in _ensure_lower_with_positive_diag so that
+# the transformed diagonal matches a target Cholesky block.
+def invert_softplus_diag(L_block: tf.Tensor) -> tf.Tensor:
+    d = tf.linalg.diag_part(L_block)
+    d_raw = softplus_inverse(tf.maximum(d, default_jitter()))
+    return L_block - tf.linalg.diag(d) + tf.linalg.diag(d_raw)
 
 
 def _ensure_lower_with_positive_diag(L: tf.Tensor) -> tf.Tensor:

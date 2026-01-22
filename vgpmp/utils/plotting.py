@@ -125,8 +125,8 @@ def plot_mean_and_obstacle(
         K_prior,
         model,
         posterior,
-        obstacle_center,
-        obstacle_radius,
+        nominal,
+        obstacles,
         epsilon,
         grid_size,
     ):
@@ -140,13 +140,21 @@ def plot_mean_and_obstacle(
     x_mean = mean[:, 0]         # (M,)
     y_mean = mean[:, 1]         # (M,)
 
+    nominal = nominal.numpy() if tf.is_tensor(nominal) else np.asarray(nominal)
+    x_nom = nominal[:, 0]
+    y_nom = nominal[:, 1]
+
     # ----- Plot -----
     fig, ax = plt.subplots(figsize=(6, 6))
+
     # mean trajectory
     ax.plot(x_mean, y_mean, label="Mean trajectory")
+
+    ax.plot(x_nom, y_nom, linestyle="--", linewidth=2, label="Nominal trajectory")
+
     # covairance ellipses
     first_ellipse = True
-    for i in range(0, len(x_mean), 2):
+    for i in range(0, len(x_mean), 1):
         cov = variance[i, :dof, :dof]       # (dof, dof)
         if not np.all(np.isfinite(cov)):
             continue
@@ -159,18 +167,33 @@ def plot_mean_and_obstacle(
         first_ellipse = False
 
     # Obstacle circle and (optional) safety buffer R+epsilon
-    circle = Circle(obstacle_center, obstacle_radius, color="red", alpha=0.25, label="obstacle")
-    buffer = Circle(
-        obstacle_center,
-        obstacle_radius + epsilon,
-        fill=False,
-        linestyle="--",
-        alpha=0.7,
-        color="red",
-        label="Radius + epsilon",
-    )
-    ax.add_patch(circle)
-    ax.add_patch(buffer)
+    # obstacles + safety buffers
+    first_obs = True
+    first_buf = True
+    for (center, radius) in obstacles:
+        cx, cy = center
+
+        circle = Circle(
+            (cx, cy),
+            radius,
+            color="red",
+            alpha=0.25,
+            label="Obstacle" if first_obs else None,
+        )
+        buffer = Circle(
+            (cx, cy),
+            radius + float(epsilon),
+            fill=False,
+            linestyle="--",
+            alpha=0.7,
+            color="red",
+            label="Radius + epsilon" if first_buf else None,
+        )
+        ax.add_patch(circle)
+        ax.add_patch(buffer)
+
+        first_obs = False
+        first_buf = False
 
     ax.set_xlim(-5, grid_size+5)
     ax.set_ylim(-5, grid_size+5)
